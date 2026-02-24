@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/logger"
@@ -15,10 +16,14 @@ import (
 )
 
 type ContextBuilder struct {
-	workspace    string
-	skillsLoader *skills.SkillsLoader
-	memory       *MemoryStore
-	tools        *tools.ToolRegistry // Direct reference to tool registry
+	workspace           string
+	skillsLoader        *skills.SkillsLoader
+	memory              *MemoryStore
+	tools               *tools.ToolRegistry // Direct reference to tool registry
+	systemPromptCache   string              // Cached system prompt
+	systemPromptTime    time.Time           // When the cache was created
+	systemPromptCacheMu sync.RWMutex        // Protect cache access
+	cacheTTL            time.Duration       // How long to keep the cache (30 seconds)
 }
 
 func getGlobalConfigDir() string {
@@ -37,9 +42,11 @@ func NewContextBuilder(workspace string) *ContextBuilder {
 	globalSkillsDir := filepath.Join(getGlobalConfigDir(), "skills")
 
 	return &ContextBuilder{
-		workspace:    workspace,
-		skillsLoader: skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir),
-		memory:       NewMemoryStore(workspace),
+		workspace:        workspace,
+		skillsLoader:     skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir),
+		memory:           NewMemoryStore(workspace),
+		cacheTTL:         30 * time.Second,             // Cache system prompt for 30 seconds
+		systemPromptTime: time.Now().Add(-time.Minute), // Start with expired cache
 	}
 }
 
@@ -108,7 +115,36 @@ func (cb *ContextBuilder) buildToolsSection() string {
 	return sb.String()
 }
 
+// isCacheFresh checks if the cached system prompt is still valid
+func (cb *ContextBuilder) isCacheFresh() bool {
+	cb.systemPromptCacheMu.RLock()
+	defer cb.systemPromptCacheMu.RUnlock()
+	return time.Since(cb.systemPromptTime) < cb.cacheTTL
+}
+
+// BuildSystemPrompt returns the system prompt with caching to avoid rebuilding on every message
 func (cb *ContextBuilder) BuildSystemPrompt() string {
+	// Check if cache is fresh
+	if cb.isCacheFresh() {
+		cb.systemPromptCacheMu.RLock()
+		defer cb.systemPromptCacheMu.RUnlock()
+		return cb.systemPromptCache
+	}
+
+	// Build fresh system prompt
+	prompt := cb.buildSystemPromptContent()
+
+	// Update cache
+	cb.systemPromptCacheMu.Lock()
+	defer cb.systemPromptCacheMu.Unlock()
+	cb.systemPromptCache = prompt
+	cb.systemPromptTime = time.Now()
+
+	return prompt
+}
+
+// buildSystemPromptContent builds the complete system prompt from scratch
+func (cb *ContextBuilder) buildSystemPromptContent() string {
 	parts := []string{}
 
 	// Core identity section
@@ -157,6 +193,13 @@ func (cb *ContextBuilder) LoadBootstrapFiles() string {
 	}
 
 	return sb.String()
+}
+
+// InvalidateSystemPromptCache clears the system prompt cache to force a rebuild on the next call
+func (cb *ContextBuilder) InvalidateSystemPromptCache() {
+	cb.systemPromptCacheMu.Lock()
+	defer cb.systemPromptCacheMu.Unlock()
+	cb.systemPromptTime = time.Now().Add(-time.Minute) // Expire the cache
 }
 
 func (cb *ContextBuilder) BuildMessages(
